@@ -1,5 +1,4 @@
 import http from "node:http";
-import { createHash, timingSafeEqual } from "node:crypto";
 
 const port = Number(process.env.PORT || 3000);
 
@@ -8,33 +7,24 @@ const upstream =
   "https://global-fishing-watch-production.up.railway.app/mcp";
 
 const token = process.env.GFW_TOKEN;
+const accessPath = process.env.ACCESS_PATH;
 
 if (!token) {
   console.error("GFW_TOKEN is required");
   process.exit(1);
 }
 
-const proxyKey = process.env.PROXY_KEY;
-
-if (!proxyKey) {
-  console.error("PROXY_KEY is required");
+if (!accessPath) {
+  console.error("ACCESS_PATH is required");
   process.exit(1);
 }
 
-const sha256 = (value) => createHash("sha256").update(value).digest();
-
-const proxyKeyHash = sha256(`Bearer ${proxyKey}`);
-
-// Constant-time comparison of the caller's Authorization header.
-function isAuthorized(req) {
-  return timingSafeEqual(
-    sha256(req.headers.authorization || ""),
-    proxyKeyHash
-  );
-}
+const normalizedPath = accessPath.startsWith("/")
+  ? accessPath
+  : `/${accessPath}`;
 
 const server = http.createServer(async (req, res) => {
-  // Railway / external health check
+  // Railway health check — contains no credentials.
   if (req.url === "/health") {
     res.writeHead(200, {
       "content-type": "application/json"
@@ -44,23 +34,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Only expose the MCP endpoint
-  if (!req.url?.startsWith("/mcp")) {
+  /*
+   * Only the secret MCP path is accepted.
+   * Requests to /mcp or other paths receive 404.
+   */
+  const requestPath = (req.url || "").split("?")[0];
+
+  if (requestPath !== normalizedPath) {
     res.writeHead(404, {
       "content-type": "application/json"
     });
 
     res.end(JSON.stringify({ error: "Not found" }));
-    return;
-  }
-
-  if (!isAuthorized(req)) {
-    res.writeHead(401, {
-      "content-type": "application/json",
-      "www-authenticate": "Bearer"
-    });
-
-    res.end(JSON.stringify({ error: "Unauthorized" }));
     return;
   }
 
@@ -73,15 +58,11 @@ const server = http.createServer(async (req, res) => {
 
     const body = Buffer.concat(chunks);
 
-    /*
-     * Forward MCP headers while deliberately removing:
-     * - the client's Authorization header
-     * - hop-by-hop headers
-     * - content-length, which fetch will calculate
-     */
     const headers = {};
 
     for (const [key, value] of Object.entries(req.headers)) {
+      const lowerKey = key.toLowerCase();
+
       if (
         value !== undefined &&
         ![
@@ -90,7 +71,7 @@ const server = http.createServer(async (req, res) => {
           "content-length",
           "connection",
           "transfer-encoding"
-        ].includes(key.toLowerCase())
+        ].includes(lowerKey)
       ) {
         headers[key] = Array.isArray(value)
           ? value.join(", ")
@@ -98,13 +79,16 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // Inject the Global Fishing Watch credential server-side.
+    /*
+     * The caller never sees this credential.
+     * Railway injects GFW_TOKEN at runtime.
+     */
     headers.authorization = `Bearer ${token}`;
 
     const url = new URL(upstream);
 
-    // Preserve query parameters.
-    const queryIndex = req.url.indexOf("?");
+    // Preserve any MCP query parameters.
+    const queryIndex = (req.url || "").indexOf("?");
 
     if (queryIndex !== -1) {
       url.search = req.url.slice(queryIndex);
@@ -152,7 +136,9 @@ const server = http.createServer(async (req, res) => {
   } catch (error) {
     console.error(
       "GFW proxy error:",
-      error instanceof Error ? error.message : "Unknown error"
+      error instanceof Error
+        ? error.message
+        : "Unknown error"
     );
 
     if (!res.headersSent) {
