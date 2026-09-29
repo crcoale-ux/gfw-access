@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 const port = Number(process.env.PORT || 3000);
 
@@ -11,6 +12,25 @@ const token = process.env.GFW_TOKEN;
 if (!token) {
   console.error("GFW_TOKEN is required");
   process.exit(1);
+}
+
+const proxyKey = process.env.PROXY_KEY;
+
+if (!proxyKey) {
+  console.error("PROXY_KEY is required");
+  process.exit(1);
+}
+
+const sha256 = (value) => createHash("sha256").update(value).digest();
+
+const proxyKeyHash = sha256(`Bearer ${proxyKey}`);
+
+// Constant-time comparison of the caller's Authorization header.
+function isAuthorized(req) {
+  return timingSafeEqual(
+    sha256(req.headers.authorization || ""),
+    proxyKeyHash
+  );
 }
 
 const server = http.createServer(async (req, res) => {
@@ -31,6 +51,16 @@ const server = http.createServer(async (req, res) => {
     });
 
     res.end(JSON.stringify({ error: "Not found" }));
+    return;
+  }
+
+  if (!isAuthorized(req)) {
+    res.writeHead(401, {
+      "content-type": "application/json",
+      "www-authenticate": "Bearer"
+    });
+
+    res.end(JSON.stringify({ error: "Unauthorized" }));
     return;
   }
 
